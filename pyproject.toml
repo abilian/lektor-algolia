@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "lektor-algolia"
+version = "0.1.0"
+description = "Lektor plugin to support generating an Algolia search index from your data"
+license = "MIT"
+homepage = "https://github.com/sherbondy/lektor-algolia"
+authors = ["Ethan Sherbondy <sherbondye@gmail.com>"]
+
+packages = [{ include = "*", from = "src" }]
+
+
+[tool.poetry.dependencies]
+python = "^3.7"
+
+lektor = "*"
+algoliasearch = "*"
+devtools = "*"
