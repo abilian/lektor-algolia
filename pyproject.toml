@@ -15,3 +15,6 @@ python = "^3.7"
 lektor = "*"
 algoliasearch = "*"
 devtools = "*"
+
+[tool.poetry.dev-dependencies]
+mypy = "^0.800"

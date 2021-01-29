@@ -1,10 +1,12 @@
+from typing import Any, Collection, Dict, List, Optional, Set
+
 from algoliasearch.exceptions import AlgoliaException
 from algoliasearch.search_client import SearchClient
-from devtools import debug
+from algoliasearch.search_index import SearchIndex
 from lektor.db import Record
-from lektor.publisher import Publisher, PublishError
 from lektor.pluginsystem import Plugin
 from lektor.project import Project
+from lektor.publisher import Publisher, PublishError
 from lektor.types.formats import Markdown
 
 
@@ -23,12 +25,18 @@ class AlgoliaPlugin(Plugin):
 
 
 class AlgoliaPublisher(Publisher):
+    #: The Algolia search client
+    algolia: Optional[SearchClient]
+    #: The index name
+    index_name: str
+    #: The index object
+    index: Optional[SearchIndex]
+
     def __init__(self, env, output_path):
         super().__init__(env, output_path)
-        # algolia = the algolia client, index = the index object
         self.algolia = None
-        self.index = None
         self.index_name = ""
+        self.index = None
 
     def connect(self, credentials):
         app_id = credentials["app_id"]
@@ -48,8 +56,9 @@ class AlgoliaPublisher(Publisher):
         self.connect(merged_creds)
 
         self.index_name = target_url.netloc
-        self.index = self.algolia.init_index(self.index_name)
-        if not self.verify_index_exists():
+        try:
+            self.index = self.algolia.init_index(self.index_name)
+        except AlgoliaException as e:
             raise PublishError(
                 f'Algolia index "{self.index_name}" does not exist, '
                 f"or the API key provided does not have access to it. "
@@ -62,85 +71,66 @@ class AlgoliaPublisher(Publisher):
         local_keys = {record["objectID"] for record in local}
         yield "Found %d local records to index." % len(local)
 
-        remote = self.list_remote()
-        yield "Found %d existing remote records in the index." % len(remote)
+        remote_keys = self.list_remote_keys()
+        yield "Found %d existing remote records in the index." % len(remote_keys)
 
         yield "Computing diff for index update..."
-        diff = self.compute_diff(local_keys, remote)
-        res_delete = self.index.delete_objects(list(diff["delete"]))
+        keys_to_delete: List[str] = list(set(remote_keys) - set(local_keys))
+        res_delete = self.index.delete_objects(keys_to_delete)
         delete_count = len(res_delete.raw_responses)
-        yield "Deleted %d stale records from remote index." % delete_count
+        yield f"Deleted {delete_count} stale records from remote index."
 
         res_add = self.index.save_objects(local)
         add_count = len(res_add.raw_responses)
-        yield "Finished submitting %d new/updated records to the index." % add_count
+        yield f"Finished submitting {add_count} new/updated records to the index."
         yield (
             "Processing the updated index is asynchronous, so Aloglia may take a "
             "while to reflect the changes."
         )
 
-    def verify_index_exists(self):
-        exists = True
-        try:
-            settings = self.index.get_settings()
-        except AlgoliaException as e:
-            print(e)
-            exists = False
-        return exists
-
-    def list_remote(self):
+    def list_remote_keys(self) -> List[str]:
         """handle pagination eventually..."""
-        all_object_ids = set()
+        all_object_ids: Set[str] = set()
         params = {"attributesToRetrieve": "objectID", "hitsPerPage": 100}
         first_page = self.index.search("", params)
         first_page_hits = hit_object_ids(first_page)
         all_object_ids.update(first_page_hits)
+
         page_count = first_page["nbPages"]
         for i in range(1, page_count):
-            next_page = self.index.search("", params.extend({"page": i}))
-            if next_page["nbHits"] > 0:
-                next_page_hits = hit_object_ids(next_page["hits"])
-                all_object_ids.update(next_page_hits)
-            else:
+            next_page = self.index.search("", dict(params, page=i))
+            if next_page["nbHits"] <= 0:
                 break
-        return all_object_ids
+            next_page_hits = hit_object_ids(next_page["hits"])
+            all_object_ids.update(next_page_hits)
 
-    def add_index_children_json(self, pad, record):
-        record_json = []
-        for child in record.children.all():
-            if is_indexable(child):
-                model = child.datamodel
-                model_json = model.to_json(pad, child)
-                model_field_names = public_field_names(model_json["fields"])
-                child_data = {
-                    field_name: stringify(child, field_name)
-                    for field_name in model_field_names
-                }
-                child_data["objectID"] = child["_gid"]
-                # upload path so we can send the user to the right url for a search query!
-                child_data["_path"] = child["_path"]
-                record_json.append(child_data)
-            record_json += self.add_index_children_json(pad, child)
-        return record_json
+        return list(all_object_ids)
 
-    def list_local(self):
+    def list_local(self) -> List[Dict[str, Any]]:
         project = Project.discover()
         env = project.make_env()
         pad = env.new_pad()
         root = pad.root
+        return get_all_records(pad, root)
 
-        all_records = self.add_index_children_json(pad, root)
-        return all_records
 
-    def compute_diff(self, local_keys, remote_keys):
-        """Compute the changeset for updating remote to match local"""
-        diff = {
-            "add": [],
-            "delete": [],
-        }
-        diff["delete"] = remote_keys.difference(local_keys)
-        diff["add"] = local_keys
-        return diff
+def get_all_records(pad, record) -> List[Dict[str, Any]]:
+    records = []
+    for child in record.children.all():
+        if is_indexable(child):
+            model = child.datamodel
+            model_json = model.to_json(pad, child)
+            model_field_names = public_field_names(model_json["fields"])
+            child_data = {
+                field_name: stringify(child, field_name)
+                for field_name in model_field_names
+            }
+            child_data["objectID"] = child["_gid"]
+            # upload path so we can send the user to the right url for a search query!
+            child_data["_path"] = child["_path"]
+            records.append(child_data)
+        records += get_all_records(pad, child)
+    return records
 
 
 def public_field_names(model_fields):
@@ -156,10 +146,10 @@ def stringify(record, field_name):
     val = record[field_name]
     if isinstance(val, Markdown):
         return val.source
-    return str(val).encode("utf8")
+    return str(val)
 
 
-def hit_object_ids(search_page):
+def hit_object_ids(search_page: Dict[str, Any]) -> Set[str]:
     return {hit["objectID"] for hit in search_page["hits"]}
 
 
