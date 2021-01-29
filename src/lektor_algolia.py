@@ -1,4 +1,4 @@
-from typing import Any, Collection, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 from algoliasearch.exceptions import AlgoliaException
 from algoliasearch.search_client import SearchClient
@@ -25,62 +25,51 @@ class AlgoliaPlugin(Plugin):
 
 
 class AlgoliaPublisher(Publisher):
-    #: The Algolia search client
-    algolia: Optional[SearchClient]
-    #: The index name
-    index_name: str
-    #: The index object
-    index: Optional[SearchIndex]
+    algolia: SearchClient
 
-    def __init__(self, env, output_path):
-        super().__init__(env, output_path)
-        self.algolia = None
-        self.index_name = ""
-        self.index = None
-
-    def connect(self, credentials):
-        app_id = credentials["app_id"]
-        api_key = credentials["api_key"]
-        self.algolia = SearchClient.create(app_id, api_key)
-
-    def publish(self, target_url, credentials=None, **extra):
+    def get_index(self, index_name, credentials) -> SearchIndex:
         merged_creds = merge_credentials(self.env.algolia_credentials, credentials)
 
-        yield "Checking for Algolia credentials and index..."
+        # yield "Checking for Algolia credentials and index..."
         if "app_id" not in merged_creds or "api_key" not in merged_creds:
             raise PublishError(
                 "Could not connect to Algolia. "
                 + "Make sure api_key and app_id are present in your configs/algolia.ini file."
             )
 
-        self.connect(merged_creds)
+        app_id = merged_creds["app_id"]
+        api_key = merged_creds["api_key"]
+        self.algolia = SearchClient.create(app_id, api_key)
 
-        self.index_name = target_url.netloc
         try:
-            self.index = self.algolia.init_index(self.index_name)
-        except AlgoliaException as e:
+            index = self.algolia.init_index(index_name)
+        except AlgoliaException as exc:
             raise PublishError(
-                f'Algolia index "{self.index_name}" does not exist, '
+                f'Algolia index "{index_name}" does not exist, '
                 f"or the API key provided does not have access to it. "
                 f"Please create the index / verify your credentials on their website."
-            )
+            ) from exc
 
-        yield "Verified Algolia index exists and is accessible via your credentials."
+        return index
 
-        local = self.list_local()
+    def publish(self, target_url, credentials=None, **extra):
+        index_name = target_url.netloc
+        index = self.get_index(index_name, credentials)
+
+        local = list_local()
         local_keys = {record["objectID"] for record in local}
         yield "Found %d local records to index." % len(local)
 
-        remote_keys = self.list_remote_keys()
+        remote_keys = list_remote_keys(index)
         yield "Found %d existing remote records in the index." % len(remote_keys)
 
         yield "Computing diff for index update..."
         keys_to_delete: List[str] = list(set(remote_keys) - set(local_keys))
-        res_delete = self.index.delete_objects(keys_to_delete)
+        res_delete = index.delete_objects(keys_to_delete)
         delete_count = len(res_delete.raw_responses)
         yield f"Deleted {delete_count} stale records from remote index."
 
-        res_add = self.index.save_objects(local)
+        res_add = index.save_objects(local)
         add_count = len(res_add.raw_responses)
         yield f"Finished submitting {add_count} new/updated records to the index."
         yield (
@@ -88,30 +77,34 @@ class AlgoliaPublisher(Publisher):
             "while to reflect the changes."
         )
 
-    def list_remote_keys(self) -> List[str]:
-        """handle pagination eventually..."""
-        all_object_ids: Set[str] = set()
-        params = {"attributesToRetrieve": "objectID", "hitsPerPage": 100}
-        first_page = self.index.search("", params)
-        first_page_hits = hit_object_ids(first_page)
-        all_object_ids.update(first_page_hits)
+        self.algolia.close()
 
-        page_count = first_page["nbPages"]
-        for i in range(1, page_count):
-            next_page = self.index.search("", dict(params, page=i))
-            if next_page["nbHits"] <= 0:
-                break
-            next_page_hits = hit_object_ids(next_page["hits"])
-            all_object_ids.update(next_page_hits)
 
-        return list(all_object_ids)
+def list_remote_keys(index: SearchIndex) -> List[str]:
+    """handle pagination eventually..."""
+    all_object_ids: Set[str] = set()
+    params = {"attributesToRetrieve": "objectID", "hitsPerPage": 100}
+    first_page = index.search("", params)
+    first_page_hits = hit_object_ids(first_page)
+    all_object_ids.update(first_page_hits)
 
-    def list_local(self) -> List[Dict[str, Any]]:
-        project = Project.discover()
-        env = project.make_env()
-        pad = env.new_pad()
-        root = pad.root
-        return get_all_records(pad, root)
+    page_count = first_page["nbPages"]
+    for i in range(1, page_count):
+        next_page = index.search("", dict(params, page=i))
+        if next_page["nbHits"] <= 0:
+            break
+        next_page_hits = hit_object_ids(next_page["hits"])
+        all_object_ids.update(next_page_hits)
+
+    return list(all_object_ids)
+
+
+def list_local() -> List[Dict[str, Any]]:
+    project = Project.discover()
+    env = project.make_env()
+    pad = env.new_pad()
+    root = pad.root
+    return get_all_records(pad, root)
 
 
 def get_all_records(pad, record) -> List[Dict[str, Any]]:

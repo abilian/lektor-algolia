@@ -26,8 +26,8 @@ setup(
     package_data={},
     install_requires=["algoliasearch", "devtools", "lektor"],
     entry_points={
-        'lektor.plugins': [
-            'algolia = lektor_algolia:AlgoliaPlugin',
+        "lektor.plugins": [
+            "algolia = lektor_algolia:AlgoliaPlugin",
         ]
-    }
+    },
 )
